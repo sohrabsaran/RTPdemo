@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<!-- Location: https://github.com/sohrabsaran/RTPdemo 
+License: MIT
+ -->
+<pre style="white-space:pre-line">
+PoC to demonstrate distributed transaction logic in realtime payment.
+It should show that network error does not cause unwanted issues.
+Out of scope - how local db transactions work.
+A has to pay B Rs. 10 in realtime.
+Bank account of A: Rs.100.
+Bank account of B: Rs.0.
+So following is done (order may be subject to fine-tuning):
+1. Rs. 10 is set aside from A's account into a field that is the amount locked for paying out.
+So we get:
+A's available funds = Rs. 90
+A's funds locked for paying out = Rs. 10
+2. A new unique transaction id is generated. A UUID can be used for this; it is supposed to be unique in space and time.
+The 'unique in space' part of time comes from the unique MAC address of the network card of the generating machine.
+The transaction id noted down is noted down more or less permanently (say 5-10 years).
+3. The new transaction id, the payee's account and bank details, and the payer's bank and account details are sent over the internet using a suitable signed and secured format to the bank of the payee.
+4. The payee credits the money to account of B, notes down the transaction id and informs A that it has processed the transaction.
+The transaction id noted down is noted down more or less permanently (say 5-10 years).
+5. Once A gets notification that the transaction has been processed, it makes A's funds locked for paying out = Rs. 0 and marks the 
+transaction as successful.
+6. If in step 3, B did not respond or in step 4 the message from B somehow did not reach A, then A can retry sending the transaction information for (say) 2 more times, after which A will
+show a message to the user and in the background will keep trying to contact B but at a lower frequency for 24 hours. After 24 hours 
+if B does not respond, the money will be reverted to A's available funds, which will again become Rs. 100. In the background, the 
+bank of A will 'forever' ask B to cancel the transaction or get confirmation from B that it never received news about the transaction.
+7. If in step 6 retry within 24 hours by A receives response from B, the transaction will succeed and A will mark the transaction as 
+succeeded and  makes A's funds locked for paying out = Rs. 0.
+
+So overall we have:
+- A 10 second window for the realtime transaction to succeed, with 2 or 3 retries.
+- A 24-hour window for transaction to succeed or rollback if the server of bank 'B' is down.
+- A 5 or 6 year persistent record of the transaction.
+
+A js demo can be built where we have a button to click to initiate the payment, and another button to simulate a communication
+loss of the message currently being transmitted when clicked.
+This demo can show how the system recovers from the communication losses and ensures that the transaction is processed.
+</pre>
+<button type=button onclick="makepayment()">Make Payment</button><br><br>
+<button type=button onclick="simulatecommloss()">Simulate Communication Loss</button><br><br>
+Log window:<br>
+<textarea id="logwindow" rows="10" cols="80" readonly></textarea>
+<script>
+"use strict";
+
+var A={},B={};
+var amount_to_transfer;
+var num_of_retries_for_realtime_transfer;
+var comm_loss_occured;
+var B_down_recovery_window_in_seconds;
+var B_down_recovery_retry_in_seconds;
+var B_down_num_of_retries;
+var is_realtime_retry_in_progress;
+var transaction_completed;
+var realtimeretry_timer;
+var B_down_retry_timer;
+
+function el(s){return document.getElementById(s)}
+var logwindow = el('logwindow')
+function log(s)
+{
+	logwindow.value = logwindow.value + s + "\n"
+	logwindow.scrollTop = logwindow.scrollHeight
+}
+
+function makepayment()
+{
+	logwindow.value=''
+	log('Initializing variables on both sides (A and B) for the repeatable demo')
+	A.available_funds_for_transfer = 100;log('A.available_funds_for_transfer = 100')
+	A.funds_locked_for_ongoing_transfer = 0;log('A.funds_locked_for_ongoing_transfer = 0')
+	B.available_funds_for_transfer = 0;log('B.available_funds_for_transfer = 0')
+	B.recorded_transactions = {}
+	amount_to_transfer=10;log("amount_to_transfer=10")
+	A.pending_realtime_payments_to_make = {}
+	A.transactionid = "{abcdefghijklmnop}"
+	B_down_recovery_window_in_seconds = 30;log('B_down_recovery_window_in_seconds = 30')
+	B_down_recovery_retry_in_seconds = 5;log('B_down_recovery_retry_in_seconds = 5')
+	B_down_num_of_retries = B_down_recovery_window_in_seconds/B_down_recovery_retry_in_seconds;
+	log('So B_down_recovery_retry_in_seconds = '+B_down_num_of_retries)
+	is_realtime_retry_in_progress = true
+	transaction_completed = false
+	num_of_retries_for_realtime_transfer=3
+	realtimeretry_timer = null;
+	B_down_retry_timer = null;
+	log('Done with initializing variables on both sides (A and B) for the repeatable demo...')
+	
+	log('begin local db transaction on A')
+	
+	A.available_funds_for_transfer -= amount_to_transfer;log("A.available_funds_for_transfer -= amount_to_transfer");
+	A.funds_locked_for_ongoing_transfer += amount_to_transfer;log("A.funds_locked_for_ongoing_transfer += amount_to_transfer");
+	
+	A.pending_realtime_payments_to_make[A.transactionid] = {transid:A.transactionid,from:"bank of A, A's account",to:"bank of B, B's account",amount:amount_to_transfer};
+	log("A.pending_realtime_payments_to_make[A.transactionid] = "+
+	JSON.stringify({transid:A.transactionid,from:"bank of A, A's account",to:"bank of B, B's account",amount:amount_to_transfer})+")")
+	
+	log('end local db transaction on A')
+	
+	log('START sending of realtime transaction for 10 seconds, with 3 retries')	
+	doRetry()
+}
+
+//code at 'A' end
+function processAckFromBtoA()
+{
+	if(transaction_completed){return}
+	if(comm_loss_occured == true)
+	{
+		comm_loss_occured = false
+		log('comm loss occurred sending ack from B to A!!!')
+		return
+	}
+	
+	log('begin local transaction on A to process ack from B to A...')
+	transaction_completed = true
+	if(realtimeretry_timer != null){clearTimeout(realtimeretry_timer);realtimeretry_timer=null}
+	if(B_down_retry_timer != null){clearTimeout(B_down_retry_timer);B_down_retry_timer=null}
+	var transdetails = A.pending_realtime_payments_to_make[A.transactionid]
+	delete A.pending_realtime_payments_to_make[A.transactionid]
+	A.funds_locked_for_ongoing_transfer -= transdetails.amount
+	log('end local transaction on A to process ack from B to A...')
+	log('Now A.funds_locked_for_ongoing_transfer='+A.funds_locked_for_ongoing_transfer)
+	log('Now A.available_funds_for_transfer='+A.available_funds_for_transfer)
+	log('Now B.available_funds_for_transfer='+B.available_funds_for_transfer)
+	log('END OF DEMO')
+}
+
+function doRetry()
+{	
+	log('YOU CAN SIMULATE COMM LOSS HERE BY CLICKING ON THE BUTTON, WAITING FOR 3 SECONDS...')
+	comm_loss_occured = false
+	setTimeout(sendMsgFromAtoB, 3000);
+}
+
+function sendMsgFromAtoB()
+{
+	processMessageFromA_atB()
+	
+	//The additional 3 second delay is added below, because we are letting the user click the 
+	//message loss button by waiting for 3 seconds when sending ack from B back to A
+	if(is_realtime_retry_in_progress)
+	{		
+		realtimeretry_timer = setTimeout(dorealtimeretry,3000 + 3000)
+	}
+	else
+	{
+		B_down_retry_timer = setTimeout(do_B_down_retry,B_down_recovery_retry_in_seconds*1000 + 3000)
+	}
+}
+
+//Code at 'B' end 
+function processMessageFromA_atB()
+{
+	if(comm_loss_occured == true)
+	{
+		comm_loss_occured = false
+		log('comm loss occurred sending data from A to B, retrying if any retries left...')
+		return
+	}
+	
+	log('B received the transaction details, will decrypt and validate it...')
+		
+	if(A.transactionid in B.recorded_transactions)
+	{
+		log("B has already recorded this transaction!")
+	}
+	else
+	{
+		log("Start local db transaction on B to record and effect the payment transaction")
+		B.recorded_transactions[A.transactionid] = A.pending_realtime_payments_to_make[A.transactionid]
+		B.available_funds_for_transfer+=A.pending_realtime_payments_to_make[A.transactionid].amount
+		log("End local db transaction on B to record and effect the payment transaction")
+	}
+	
+	log("Now informing A that B has just processed or has previously processed this transaction...")
+	log('YOU CAN SIMULATE COMM LOSS HERE BY CLICKING ON THE BUTTON, WAITING FOR 3 SECONDS...')
+	comm_loss_occured = false
+	setTimeout(processAckFromBtoA, 3000);
+}
+
+//Code at 'A' end
+function dorealtimeretry()
+{
+	log('num_of_retries_for_realtime_transfer that are left='+num_of_retries_for_realtime_transfer)
+	if(num_of_retries_for_realtime_transfer == 0)
+	{
+		log('All retries for realtime payment from A to B are exhausted...')
+		is_realtime_retry_in_progress = false
+		do_B_down_retry()
+		return
+	}
+	num_of_retries_for_realtime_transfer--
+	doRetry()
+}
+
+//code at 'A' side
+function do_B_down_retry()
+{
+	log("Doing 'B down' retry, retries left: "+B_down_num_of_retries+"...")
+	if(B_down_num_of_retries ==0)
+	{		
+		log('B is totally down!!! Reverting the funds to A and marking the transaction as to be rolled back by B')
+		log("Showing Transaction rollback by B post '24 hours' is out of scope of this demo...")
+		log('begin local transaction on A to cancel the payment transaction...')
+		var transdetails = A.pending_realtime_payments_to_make[A.transactionid]
+		delete A.pending_realtime_payments_to_make[A.transactionid]
+		A.funds_locked_for_ongoing_transfer -= transdetails.amount
+		A.available_funds_for_transfer += transdetails.amount
+		log('end local transaction on A to cancel the payment transaction...')
+		log('Now A.funds_locked_for_ongoing_transfer='+A.funds_locked_for_ongoing_transfer)
+		log('Now A.available_funds_for_transfer='+A.available_funds_for_transfer)
+		log('Now B.available_funds_for_transfer='+B.available_funds_for_transfer)
+		log('END OF DEMO')
+		return
+	}
+	B_down_num_of_retries--	
+	doRetry()
+}
+
+function simulatecommloss()
+{
+	comm_loss_occured = true
+}
+</script>
